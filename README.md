@@ -1,2 +1,102 @@
-# mod-optimization-Minecraft-for-multi-core-processors
-I have a multi-core server-grade processor, but Minecraft only uses a couple of its cores, which results in low FPS. This mod fixes that issue, but it only works for version 1.21.1 on NeoForge.
+# CoreFlow
+
+Мод-оптимизатор для **Minecraft 1.21.1 (NeoForge)** — тонкая настройка потоков игры под многоядерные процессоры.
+
+## Что делает мод
+
+Minecraft использует несколько системных пулов потоков. CoreFlow позволяет управлять ими:
+
+| Настройка | Что управляет |
+|---|---|
+| `workerThreads` | Пул **Worker-Main** — постройка чанков, освещение, генерация мира, загрузка ресурсов и моделей |
+| `gameThreadPriority` | Приоритет **Render thread** — главный игровой поток (рендер + тики клиента) |
+| `workerThreadPriority` | Приоритет рабочих потоков (чанки/ресурсы) |
+| `ioThreadPriority` | Приоритет **IO-Worker** — чтение/запись регионов, файлов, сеть |
+| `serverThreadPriority` | Приоритет **Server thread** — тики мира в одиночной игре |
+
+### Защита от дураков
+
+- `workerThreads` **не может быть больше количества логических ядер** процессора: значение автоматически уменьшается с предупреждением в логе.
+- Приоритеты всегда приводятся к диапазону 1..10.
+- Настройки можно задавать и через параметр JVM: `-Dcoreflow.threads=N` (перекрывает конфиг).
+
+### Почему это помогает FPS
+
+Главный игровой поток Minecraft — однопоточный, поэтому FPS в первую очередь упирается в скорость одного ядра. Но фоновые пулы (чанки, свет, ресурсы) по умолчанию работают **с тем же приоритетом, что и рендер**, и на 12-ядерном/24-поточном CPU буквально «съедают» время игрового потока во время прогрузки. CoreFlow:
+
+1. повышает приоритет игрового потока (рендер всегда в приоритете);
+2. понижает приоритет фоновых потоков, чтобы они не мешали FPS;
+3. даёт возможность выставить конкретное число рабочих потоков под вашу систему;
+4. чанки и ресурсы продолжают прогружаться параллельно на всех остальных ядрах.
+
+> Честное замечание: никакой мод не может «заставить» главный цикл Minecraft выполняться на всех ядрах сразу — это ограничение самой игры. CoreFlow настраивает то, что настраивается безопасно: пулы фоновых потоков и приоритеты. Это тот же принцип, что у известных модов Smooth Boot / ThreadTweak.
+
+## Настройка
+
+Файл: `config/coreflow-startup.toml` (создаётся при первом запуске).
+
+Либо прямо в игре: **Моды → CoreFlow → кнопка Config**.
+
+**Важно:** значения применяются при старте игры — после изменения настроек перезапустите Minecraft.
+
+Пример конфига:
+
+```toml
+workerThreads = 23            # не больше числа ядер ПК
+gameThreadPriority = 10       # рендер — высший приоритет
+workerThreadPriority = 4      # чанки/ресурсы — пониженный
+ioThreadPriority = 3          # файлы/сеть — ещё ниже
+serverThreadPriority = 7      # сервер чуть ниже рендера
+```
+
+Рекомендации:
+- **Максимальный FPS** (мир уже прогружен): `workerThreads = 8-12`, приоритеты по умолчанию.
+- **Быстрая прогрузка мира/чанков**: `workerThreads = 23` (все ядра), `workerThreadPriority = 3-4`.
+- Если после прогрузки FPS проседает — уменьшите `workerThreads` или понизьте `workerThreadPriority`.
+
+## Сборка из исходников
+
+Нужна Java 21 (JDK). Затем:
+
+```bat
+gradlew.bat build
+```
+
+Готовый jar появится в `build/libs/coreflow-1.0.0.jar`.
+
+## Готовый профиль для 12-ядерных/24-поточных CPU (Xeon E5-2690 v3 и похожие)
+
+Слабое место таких систем — низкая частота одиночного ядра (~3.5 ГГц turbo),
+а Minecraft упирается именно в него. Поэтому: рендеру — высший приоритет,
+фону — половина ядер и пониженный приоритет.
+
+`config/coreflow-startup.toml`:
+```toml
+workerThreads = 12              # половина потоков: чанки грузятся быстро без просадок FPS
+gameThreadPriority = 10         # рендер — всегда первым
+workerThreadPriority = 4        # чанки/ресурсы уступают рендеру
+ioThreadPriority = 3            # файлы — самый низкий
+serverThreadPriority = 8        # тики мира чуть ниже рендера
+```
+
+Память/JVM (16 ГБ ОЗУ на борту):
+```
+-Xms6G -Xmx6G -XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200
+-XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch
+-XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M
+-XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4
+-XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90
+-XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem
+-XX:MaxTenuringThreshold=1 -XX:ParallelGCThreads=12 -XX:ConcGCThreads=4
+```
+
+Параллельные GC-потоки ограничены 12-ю, чтобы сборки мусора не включали все 24
+потока и не вызывали микрофризы.
+
+## Установка
+
+1. Установите NeoForge для Minecraft 1.21.1.
+2. Положите `coreflow-1.0.0.jar` в папку `mods`.
+3. Запустите игру.
+
+Мод работает и на клиенте, и на сервере.
